@@ -1,0 +1,231 @@
+openapi: 3.1.0
+
+info:
+  title: Internal ML Service API
+  version: 1.0.0
+  description: >
+    Internal-only contract for the FastAPI ML microservice (Railway
+    Service 2). This service is never called by the React frontend
+    (C-02) and has no knowledge of tenancy or authentication beyond a
+    single shared secret header (BR-17, BR-18) — it receives only the
+    data Express chooses to send it and returns a prediction plus the
+    feature values used (NFR-10). Not exposed on a public-facing
+    gateway; reachable only from the Express backend's network context.
+
+servers:
+  - url: https://sme-ml-service.up.railway.app
+    description: Production (Railway, internal)
+
+security:
+  - internalServiceKey: []
+
+components:
+  securitySchemes:
+    internalServiceKey:
+      type: apiKey
+      in: header
+      name: X-Internal-Service-Key
+      description: Shared secret known only to the Express service and this FastAPI service (BR-18). Requests missing or failing this check return 401 before any computation occurs.
+
+  schemas:
+    DailySalesPoint:
+      type: object
+      description: One row of the per-product daily sales time series, assembled by Express from stock_movements / transaction_items (Part 3 §3.7).
+      properties:
+        date: { type: string, format: date }
+        quantity_sold: { type: integer, minimum: 0 }
+      required: [date, quantity_sold]
+
+    PredictStockRequest:
+      type: object
+      properties:
+        product_id: { type: string, format: uuid }
+        current_stock: { type: integer, minimum: 0 }
+        sales_history:
+          type: array
+          minItems: 14
+          items: { $ref: '#/components/schemas/DailySalesPoint' }
+          description: Ordered ascending by date. Express only calls this endpoint when length >= 14 (BR-13) — FastAPI additionally validates this defensively since it has no DB access of its own (BR-17).
+      required: [product_id, current_stock, sales_history]
+
+    PredictStockResponse:
+      type: object
+      properties:
+        product_id: { type: string, format: uuid }
+        method: { type: string, enum: [linear_regression] }
+        predicted_out_of_stock_date: { type: [string, "null"], format: date }
+        remaining_days: { type: [number, "null"] }
+        features_used:
+          type: object
+          properties:
+            sales_7d_avg: { type: number }
+            sales_14d_avg: { type: number }
+            sales_trend: { type: number, description: "Slope of the fitted regression line (units/day)." }
+      required: [product_id, method, features_used]
+
+    PredictDemandRequest:
+      type: object
+      properties:
+        product_id: { type: string, format: uuid }
+        sales_history:
+          type: array
+          minItems: 14
+          items: { $ref: '#/components/schemas/DailySalesPoint' }
+      required: [product_id, sales_history]
+
+    PredictDemandResponse:
+      type: object
+      properties:
+        product_id: { type: string, format: uuid }
+        method: { type: string, enum: [random_forest, linear_regression], description: "random_forest when sales_history has >= 30 points (BR-15), otherwise linear_regression." }
+        estimated_daily_demand: { type: number }
+        estimated_weekly_demand: { type: number }
+        features_used:
+          type: object
+          properties:
+            sales_7d_avg: { type: number }
+            sales_14d_avg: { type: number }
+            sales_trend: { type: number }
+            day_of_week_effect:
+              type: object
+              description: One-hot weekday coefficients/averages (BR-16), keyed Monday–Sunday.
+              additionalProperties: { type: number }
+      required: [product_id, method, estimated_daily_demand, estimated_weekly_demand, features_used]
+
+    InsightsRequest:
+      type: object
+      description: GET /insights takes its inputs as query parameters instead of a body — see the path definition below. Listed here only for the aggregate shape Express must assemble before calling it.
+      properties:
+        store_id: { type: string, format: uuid }
+        period: { type: string, enum: [last_7_days, last_30_days] }
+
+    InsightsResponse:
+      type: object
+      properties:
+        sales_growth_percent: { type: number }
+        best_selling_product_id: { type: [string, "null"], format: uuid }
+        fastest_growing_product_id: { type: [string, "null"], format: uuid }
+        category_performance:
+          type: array
+          items:
+            type: object
+            properties:
+              category: { type: string }
+              revenue: { type: number }
+      required: [sales_growth_percent, category_performance]
+
+    ErrorResponse:
+      type: object
+      properties:
+        detail: { type: string }
+
+paths:
+  /predict-stock:
+    post:
+      summary: Fit an in-memory regression model and return a stock-depletion forecast
+      description: >
+        Feature engineering: sales_7d_avg, sales_14d_avg, sales_trend
+        (Part 2 §2.2.5). Stateless per BR-14 — no model is persisted
+        between calls.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PredictStockRequest' }
+      responses:
+        "200":
+          description: Forecast computed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PredictStockResponse' }
+        "401":
+          description: Missing or invalid X-Internal-Service-Key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "422":
+          description: sales_history below the 14-point minimum, or malformed payload (Pydantic validation failure).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /predict-demand:
+    post:
+      summary: Predict daily/weekly demand using Random Forest or Linear Regression
+      description: >
+        Algorithm selection rule (BR-15): Random Forest Regressor when
+        sales_history has >= 30 points, otherwise Linear Regression.
+        day_of_week is one-hot encoded (BR-16).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PredictDemandRequest' }
+      responses:
+        "200":
+          description: Demand prediction computed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PredictDemandResponse' }
+        "401":
+          description: Missing or invalid X-Internal-Service-Key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "422":
+          description: sales_history below the 14-point minimum, or malformed payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /insights:
+    get:
+      summary: Compute aggregate sales insights from a pre-fetched dataset
+      description: >
+        Unlike the predict-* endpoints, Express assembles the full
+        dataset (transactions + products for the period) and POSTs it
+        — documented here as a GET for parity with the public-facing
+        contract, but implemented as POST internally since the payload
+        exceeds practical query-string size. See x-implementation-note.
+      x-implementation-note: >
+        Implemented as POST /insights internally (body = pre-aggregated
+        per-product sales rows for the period) even though the public
+        Express endpoint is GET /api/v1/ml/insights — Express performs
+        the GET-to-POST translation so the public contract stays
+        RESTful while this internal call stays within body-size limits.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                store_id: { type: string, format: uuid }
+                period: { type: string, enum: [last_7_days, last_30_days] }
+                rows:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      product_id: { type: string, format: uuid }
+                      category: { type: string }
+                      date: { type: string, format: date }
+                      quantity_sold: { type: integer }
+                      revenue: { type: number }
+              required: [store_id, period, rows]
+      responses:
+        "200":
+          description: Insights computed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InsightsResponse' }
+        "401":
+          description: Missing or invalid X-Internal-Service-Key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "422":
+          description: Malformed payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }

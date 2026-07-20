@@ -1,0 +1,1124 @@
+openapi: 3.1.0
+
+info:
+  title: SME Sales & Inventory Management API
+  version: 1.0.0
+  description: >
+    Public REST API for the Cloud-Based Sales and Inventory Management
+    System with Machine Learning Analytics for SMEs. Served by the
+    Express.js backend (Railway Service 1). All endpoints are
+    multi-tenant: every authenticated request is implicitly scoped to
+    the caller's store_id (BR-01), enforced server-side and never
+    accepted as a client-supplied parameter. This service is the only
+    public entry point — the FastAPI ML microservice (see the separate
+    Internal ML Service specification) is never called directly by
+    the frontend.
+  contact:
+    name: Engineering
+  license:
+    name: Proprietary — Academic Project
+
+servers:
+  - url: https://sme-api.up.railway.app/api/v1
+    description: Production (Railway)
+
+tags:
+  - name: Auth
+    description: Authentication via Supabase Auth, proxied through Express.
+  - name: Products
+    description: Product catalog management (FR-03, FR-04).
+  - name: Inventory
+    description: Stock movement logging and low-stock visibility (FR-05, FR-06).
+  - name: Transactions
+    description: POS checkout and sales history (FR-07, FR-08, FR-09).
+  - name: Reports
+    description: Aggregated sales reporting (FR-10).
+  - name: ML
+    description: Stock forecasting, demand prediction, restock recommendation, and insights (FR-11–FR-14), orchestrated by Express against the internal FastAPI ML service.
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Supabase-issued JWT access token, obtained via POST /auth/login
+        or refreshed via POST /auth/refresh. Sent as
+        `Authorization: Bearer <token>`. Role (admin/cashier) and
+        store_id are resolved server-side from the token's subject —
+        never trust client-supplied role/store_id fields.
+
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+      description: 1-indexed page number.
+    LimitParam:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      description: Items per page (BR-21). Max 100.
+    SearchParam:
+      name: search
+      in: query
+      schema: { type: string }
+      description: Case-insensitive substring search (endpoint-specific field — see each path).
+    ProductIdPath:
+      name: productId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    TransactionIdPath:
+      name: transactionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DateFromParam:
+      name: date_from
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive range start (UTC date).
+    DateToParam:
+      name: date_to
+      in: query
+      schema: { type: string, format: date }
+      description: Inclusive range end (UTC date).
+
+  schemas:
+    ErrorItem:
+      type: object
+      properties:
+        field: { type: [string, "null"] }
+        code: { type: string, example: "INSUFFICIENT_STOCK" }
+        message: { type: string }
+      required: [code, message]
+
+    PaginationMeta:
+      type: object
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        totalPages: { type: integer }
+      required: [page, limit, total, totalPages]
+
+    UserProfile:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        store_id: { type: string, format: uuid }
+        role: { type: string, enum: [admin, cashier] }
+        full_name: { type: string }
+        email: { type: string, format: email }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+      required: [id, store_id, role, full_name, email, is_active, created_at]
+
+    Product:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        store_id: { type: string, format: uuid }
+        name: { type: string }
+        sku: { type: string }
+        category: { type: [string, "null"] }
+        price: { type: number, minimum: 0 }
+        stock_quantity: { type: integer, minimum: 0 }
+        min_stock_threshold: { type: [integer, "null"], minimum: 0 }
+        is_low_stock: { type: boolean, description: "Derived: stock_quantity <= effective threshold (BR-11)." }
+        image_url: { type: [string, "null"], format: uri }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      required: [id, store_id, name, sku, price, stock_quantity, is_active, created_at, updated_at]
+      examples:
+        - id: "b3f1c2a0-1111-4a2b-9c3d-000000000001"
+          store_id: "a1b2c3d4-0000-4000-8000-000000000001"
+          name: "Kopi Sachet 200g"
+          sku: "KOP-200"
+          category: "Beverages"
+          price: 18500
+          stock_quantity: 42
+          min_stock_threshold: 10
+          is_low_stock: false
+          image_url: "https://xyzcompany.supabase.co/storage/v1/object/public/products/kopi-200.jpg"
+          is_active: true
+          created_at: "2026-05-01T02:00:00Z"
+          updated_at: "2026-06-20T08:15:00Z"
+
+    ProductCreateRequest:
+      type: object
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        sku: { type: string, minLength: 1, maxLength: 64 }
+        category: { type: string, maxLength: 100 }
+        price: { type: number, minimum: 0 }
+        stock_quantity: { type: integer, minimum: 0, default: 0 }
+        min_stock_threshold: { type: integer, minimum: 0 }
+      required: [name, sku, price]
+      examples:
+        - name: "Kopi Sachet 200g"
+          sku: "KOP-200"
+          category: "Beverages"
+          price: 18500
+          stock_quantity: 50
+          min_stock_threshold: 10
+
+    ProductUpdateRequest:
+      type: object
+      description: >
+        SKU and stock_quantity are intentionally not editable here — stock
+        changes must go through POST /inventory/movements (BR-08) so the
+        audit log and ML training source remain complete.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        category: { type: string, maxLength: 100 }
+        price: { type: number, minimum: 0 }
+        min_stock_threshold: { type: integer, minimum: 0 }
+        is_active: { type: boolean }
+      minProperties: 1
+
+    StockMovement:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        store_id: { type: string, format: uuid }
+        product_id: { type: string, format: uuid }
+        type: { type: string, enum: [IN, OUT, ADJUSTMENT] }
+        quantity: { type: integer, minimum: 1, description: "Always positive — direction is carried by `type`." }
+        note: { type: [string, "null"] }
+        created_by: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+      required: [id, store_id, product_id, type, quantity, created_by, created_at]
+
+    StockMovementCreateRequest:
+      description: >
+        Discriminated by `type`. IN/OUT take a relative `quantity` delta;
+        ADJUSTMENT takes an absolute `new_quantity` (e.g. post stock-take
+        count) and the service layer computes the signed delta server-side.
+      oneOf:
+        - $ref: '#/components/schemas/StockInRequest'
+        - $ref: '#/components/schemas/StockOutRequest'
+        - $ref: '#/components/schemas/StockAdjustmentRequest'
+      discriminator:
+        propertyName: type
+        mapping:
+          IN: '#/components/schemas/StockInRequest'
+          OUT: '#/components/schemas/StockOutRequest'
+          ADJUSTMENT: '#/components/schemas/StockAdjustmentRequest'
+
+    StockInRequest:
+      type: object
+      properties:
+        type: { type: string, enum: [IN] }
+        product_id: { type: string, format: uuid }
+        quantity: { type: integer, minimum: 1 }
+        note: { type: string, maxLength: 500 }
+      required: [type, product_id, quantity]
+      examples:
+        - type: "IN"
+          product_id: "b3f1c2a0-1111-4a2b-9c3d-000000000001"
+          quantity: 100
+          note: "Restock from supplier PT Sumber Makmur"
+
+    StockOutRequest:
+      type: object
+      description: >
+        Manual stock-out (e.g. damaged or lost goods). Distinct from the
+        automatic OUT movements created by POST /transactions. `note` is
+        required since there is no transaction to derive context from.
+      properties:
+        type: { type: string, enum: [OUT] }
+        product_id: { type: string, format: uuid }
+        quantity: { type: integer, minimum: 1 }
+        note: { type: string, minLength: 1, maxLength: 500 }
+      required: [type, product_id, quantity, note]
+
+    StockAdjustmentRequest:
+      type: object
+      properties:
+        type: { type: string, enum: [ADJUSTMENT] }
+        product_id: { type: string, format: uuid }
+        new_quantity: { type: integer, minimum: 0 }
+        note: { type: string, minLength: 1, maxLength: 500 }
+      required: [type, product_id, new_quantity, note]
+      examples:
+        - type: "ADJUSTMENT"
+          product_id: "b3f1c2a0-1111-4a2b-9c3d-000000000001"
+          new_quantity: 38
+          note: "Physical stock-take correction"
+
+    Transaction:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        store_id: { type: string, format: uuid }
+        cashier_id: { type: string, format: uuid }
+        total_amount: { type: number, minimum: 0 }
+        created_at: { type: string, format: date-time }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/TransactionItem' }
+      required: [id, store_id, cashier_id, total_amount, created_at, items]
+
+    TransactionItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        product_id: { type: string, format: uuid }
+        product_name: { type: string, description: "Joined at read time for display; not stored on this row." }
+        quantity: { type: integer, minimum: 1 }
+        unit_price: { type: number, minimum: 0, description: "Price snapshot at time of sale (FR-09)." }
+        subtotal: { type: number, minimum: 0 }
+      required: [id, product_id, quantity, unit_price, subtotal]
+
+    TransactionCreateRequest:
+      type: object
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            properties:
+              product_id: { type: string, format: uuid }
+              quantity: { type: integer, minimum: 1 }
+            required: [product_id, quantity]
+      required: [items]
+      examples:
+        - items:
+            - product_id: "b3f1c2a0-1111-4a2b-9c3d-000000000001"
+              quantity: 3
+            - product_id: "b3f1c2a0-1111-4a2b-9c3d-000000000002"
+              quantity: 1
+
+    SalesReport:
+      type: object
+      properties:
+        date_from: { type: string, format: date }
+        date_to: { type: string, format: date }
+        group_by: { type: string, enum: [day, week, month] }
+        total_revenue: { type: number }
+        total_transactions: { type: integer }
+        total_items_sold: { type: integer }
+        breakdown:
+          type: array
+          items:
+            type: object
+            properties:
+              period: { type: string, description: "Date/period label, shaped by group_by." }
+              revenue: { type: number }
+              transactions: { type: integer }
+        top_products:
+          type: array
+          maxItems: 5
+          items:
+            type: object
+            properties:
+              product_id: { type: string, format: uuid }
+              product_name: { type: string }
+              quantity_sold: { type: integer }
+              revenue: { type: number }
+
+    StockForecast:
+      type: object
+      properties:
+        product_id: { type: string, format: uuid }
+        status: { type: string, enum: [ok, insufficient_data] }
+        method: { type: string, enum: [linear_regression, naive_average] }
+        predicted_out_of_stock_date: { type: [string, "null"], format: date }
+        remaining_days: { type: [number, "null"] }
+        current_stock: { type: integer }
+        features_used:
+          type: [object, "null"]
+          properties:
+            sales_7d_avg: { type: number }
+            sales_14d_avg: { type: number }
+            sales_trend: { type: number }
+      required: [product_id, status, method, current_stock]
+      examples:
+        - product_id: "b3f1c2a0-1111-4a2b-9c3d-000000000001"
+          status: "ok"
+          method: "linear_regression"
+          predicted_out_of_stock_date: "2026-07-15"
+          remaining_days: 17
+          current_stock: 42
+          features_used: { sales_7d_avg: 2.4, sales_14d_avg: 2.1, sales_trend: 0.18 }
+
+    DemandPrediction:
+      type: object
+      properties:
+        product_id: { type: string, format: uuid }
+        status: { type: string, enum: [ok, insufficient_data] }
+        method: { type: string, enum: [random_forest, linear_regression, naive_average] }
+        estimated_daily_demand: { type: [number, "null"] }
+        estimated_weekly_demand: { type: [number, "null"] }
+        features_used: { type: [object, "null"] }
+      required: [product_id, status, method]
+
+    RestockRecommendation:
+      type: object
+      properties:
+        product_id: { type: string, format: uuid }
+        status: { type: string, enum: [ok, insufficient_data] }
+        current_stock: { type: integer }
+        estimated_daily_demand: { type: [number, "null"] }
+        lead_time_days: { type: integer, description: "Assumed restock lead time buffer; default 3 days." }
+        safety_stock: { type: integer }
+        recommended_restock_quantity: { type: [integer, "null"] }
+      required: [product_id, status, current_stock]
+
+    Insights:
+      type: object
+      properties:
+        period: { type: string, examples: ["last_7_days"] }
+        sales_growth_percent: { type: number, examples: [12.4] }
+        best_selling_product:
+          type: object
+          properties:
+            product_id: { type: string, format: uuid }
+            name: { type: string }
+            quantity_sold: { type: integer }
+        best_category:
+          type: object
+          properties:
+            category: { type: string }
+            revenue: { type: number }
+        fastest_growing_product:
+          type: object
+          properties:
+            product_id: { type: string, format: uuid }
+            name: { type: string }
+            growth_percent: { type: number }
+        top_products:
+          type: array
+          maxItems: 5
+          items:
+            type: object
+            properties:
+              product_id: { type: string, format: uuid }
+              name: { type: string }
+              quantity_sold: { type: integer }
+              revenue: { type: number }
+
+  responses:
+    BadRequest:
+      description: Validation error — malformed or missing fields.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success: { type: boolean, const: false }
+              message: { type: string, examples: ["Validation failed"] }
+              data: { type: "null" }
+              errors:
+                type: array
+                items: { $ref: '#/components/schemas/ErrorItem' }
+    Unauthorized:
+      description: Missing, malformed, or expired JWT.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success: { type: boolean, const: false }
+              message: { type: string, examples: ["Unauthorized"] }
+              data: { type: "null" }
+              errors:
+                type: array
+                items: { $ref: '#/components/schemas/ErrorItem' }
+    Forbidden:
+      description: Authenticated, but role or tenant scope does not permit this action.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success: { type: boolean, const: false }
+              message: { type: string, examples: ["Forbidden - admin role required"] }
+              data: { type: "null" }
+              errors:
+                type: array
+                items: { $ref: '#/components/schemas/ErrorItem' }
+    NotFound:
+      description: Resource not found (or not visible to this tenant).
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success: { type: boolean, const: false }
+              message: { type: string, examples: ["Product not found"] }
+              data: { type: "null" }
+              errors:
+                type: array
+                items: { $ref: '#/components/schemas/ErrorItem' }
+    Conflict:
+      description: State conflict — e.g. insufficient stock, duplicate SKU.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success: { type: boolean, const: false }
+              message: { type: string, examples: ["Insufficient stock for one or more items"] }
+              data: { type: "null" }
+              errors:
+                type: array
+                items: { $ref: '#/components/schemas/ErrorItem' }
+
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in with email and password
+      description: >
+        Proxies Supabase Auth's password grant, then joins the resulting
+        identity against `public.users` to attach role and store_id in a
+        single response (FR-01). No public self-registration exists
+        (BR-07) — accounts are pre-provisioned.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password, minLength: 8 }
+              required: [email, password]
+            examples:
+              default:
+                value: { email: "admin@warungsetia.id", password: "********" }
+      responses:
+        "200":
+          description: Authenticated successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string, examples: ["Login successful"] }
+                  data:
+                    type: object
+                    properties:
+                      access_token: { type: string }
+                      refresh_token: { type: string }
+                      expires_in: { type: integer, examples: [3600] }
+                      user: { $ref: '#/components/schemas/UserProfile' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401":
+          description: Invalid email or password.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: false }
+                  message: { type: string, examples: ["Invalid email or password"] }
+                  data: { type: "null" }
+                  errors:
+                    type: array
+                    items: { $ref: '#/components/schemas/ErrorItem' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out the current session
+      description: Revokes the current Supabase session server-side.
+      responses:
+        "200":
+          description: Logged out.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string, examples: ["Logged out"] }
+                  data: { type: "null" }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Exchange a refresh token for a new access token
+      description: Implements Supabase Auth's native refresh flow (A-03 / BR-26).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token: { type: string }
+              required: [refresh_token]
+      responses:
+        "200":
+          description: New token pair issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data:
+                    type: object
+                    properties:
+                      access_token: { type: string }
+                      refresh_token: { type: string }
+                      expires_in: { type: integer }
+        "401":
+          description: Refresh token invalid or expired — client must redirect to login.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: false }
+                  message: { type: string, examples: ["Refresh token expired"] }
+                  data: { type: "null" }
+                  errors:
+                    type: array
+                    items: { $ref: '#/components/schemas/ErrorItem' }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Get the current authenticated user's profile
+      responses:
+        "200":
+          description: Current user profile.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/UserProfile' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+
+  /products:
+    get:
+      tags: [Products]
+      summary: List products (Admin and Cashier)
+      description: Cashier access is read-only (FR-04); both roles see only their own store's catalog.
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - { $ref: '#/components/parameters/SearchParam' }
+        - name: category
+          in: query
+          schema: { type: string }
+        - name: is_active
+          in: query
+          schema: { type: boolean, default: true }
+          description: Filter by active status (BR-22 soft delete).
+        - name: sort
+          in: query
+          schema: { type: string, enum: [name_asc, name_desc, price_asc, price_desc, stock_asc, stock_desc, created_at_desc] }
+          description: Default `name_asc`.
+      responses:
+        "200":
+          description: Paginated product list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Product' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Products]
+      summary: Create a product (Admin only)
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductCreateRequest' }
+      responses:
+        "201":
+          description: Product created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string, examples: ["Product created"] }
+                  data: { $ref: '#/components/schemas/Product' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "409":
+          description: SKU already exists for this store (uq_products_store_sku).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: false }
+                  message: { type: string, examples: ["SKU already exists"] }
+                  data: { type: "null" }
+                  errors:
+                    type: array
+                    items: { $ref: '#/components/schemas/ErrorItem' }
+
+  /products/{productId}:
+    get:
+      tags: [Products]
+      summary: Get a single product
+      parameters: [{ $ref: '#/components/parameters/ProductIdPath' }]
+      responses:
+        "200":
+          description: Product found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/Product' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404": { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Products]
+      summary: Update a product (Admin only)
+      x-required-role: admin
+      parameters: [{ $ref: '#/components/parameters/ProductIdPath' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductUpdateRequest' }
+      responses:
+        "200":
+          description: Product updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/Product' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Products]
+      summary: Soft-delete a product (Admin only)
+      description: Sets is_active=false (BR-22). The row is never hard-deleted because products.id is referenced by transaction_items (ON DELETE RESTRICT, Part 3 §3.3).
+      x-required-role: admin
+      parameters: [{ $ref: '#/components/parameters/ProductIdPath' }]
+      responses:
+        "200":
+          description: Product deactivated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string, examples: ["Product deactivated"] }
+                  data:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      is_active: { type: boolean, const: false }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  /products/{productId}/image:
+    post:
+      tags: [Products]
+      summary: Upload or replace a product image (Admin only)
+      x-required-role: admin
+      parameters: [{ $ref: '#/components/parameters/ProductIdPath' }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: JPEG/PNG/WebP, max 5 MB.
+              required: [file]
+      responses:
+        "200":
+          description: Image uploaded to Supabase Storage; product.image_url updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data:
+                    type: object
+                    properties:
+                      image_url: { type: string, format: uri }
+        "400":
+          description: Invalid file type or size exceeds 5 MB.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: false }
+                  message: { type: string, examples: ["File must be JPEG, PNG, or WebP and under 5MB"] }
+                  data: { type: "null" }
+                  errors:
+                    type: array
+                    items: { $ref: '#/components/schemas/ErrorItem' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  /inventory/movements:
+    get:
+      tags: [Inventory]
+      summary: List stock movements (Admin only)
+      x-required-role: admin
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - { $ref: '#/components/parameters/DateFromParam' }
+        - { $ref: '#/components/parameters/DateToParam' }
+        - name: product_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: type
+          in: query
+          schema: { type: string, enum: [IN, OUT, ADJUSTMENT] }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [created_at_asc, created_at_desc], default: created_at_desc }
+      responses:
+        "200":
+          description: Paginated movement log.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/StockMovement' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Inventory]
+      summary: Record a manual stock movement — IN, OUT, or ADJUSTMENT (Admin only)
+      x-required-role: admin
+      description: Sale-driven OUT movements are created automatically by POST /transactions and cannot be submitted through this endpoint's OUT variant with the same effect — this endpoint is for manual restock/correction only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StockMovementCreateRequest' }
+      responses:
+        "201":
+          description: Movement recorded; product.stock_quantity updated atomically.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/StockMovement' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: Resulting stock_quantity would be negative (CHECK constraint violation, NFR-08).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: false }
+                  message: { type: string, examples: ["Adjustment would result in negative stock"] }
+                  data: { type: "null" }
+                  errors:
+                    type: array
+                    items: { $ref: '#/components/schemas/ErrorItem' }
+
+  /inventory/low-stock:
+    get:
+      tags: [Inventory]
+      summary: List products at or below their low-stock threshold (Admin only)
+      x-required-role: admin
+      description: Implements FR-06 — returns products where stock_quantity <= min_stock_threshold (or the store's default_low_stock_threshold when unset, BR-11).
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        "200":
+          description: Paginated low-stock product list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Product' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+
+  /transactions:
+    get:
+      tags: [Transactions]
+      summary: List transactions
+      description: Admin sees all transactions for the store; Cashier sees only transactions where cashier_id equals their own user id (BR-06).
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - { $ref: '#/components/parameters/DateFromParam' }
+        - { $ref: '#/components/parameters/DateToParam' }
+        - name: cashier_id
+          in: query
+          schema: { type: string, format: uuid }
+          description: Admin-only filter; ignored (forced to self) for Cashier callers.
+        - name: sort
+          in: query
+          schema: { type: string, enum: [created_at_asc, created_at_desc], default: created_at_desc }
+      responses:
+        "200":
+          description: Paginated transaction list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Transaction' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Transactions]
+      summary: Create a POS sale (Cashier or Admin)
+      description: >
+        Calls `fn_create_sale_transaction` via Supabase RPC as a single
+        atomic database transaction (Part 3 §3.6, Part 4 §4.2). Rejects
+        the entire sale with 409 if any line item's quantity exceeds
+        available stock — no partial sale is ever created (FR-08).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransactionCreateRequest' }
+      responses:
+        "201":
+          description: Sale completed; stock deducted; receipt data returned.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string, examples: ["Transaction completed"] }
+                  data: { $ref: '#/components/schemas/Transaction' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "404":
+          description: One or more product_id values do not exist for this store.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: false }
+                  message: { type: string, examples: ["Product not found"] }
+                  data: { type: "null" }
+                  errors:
+                    type: array
+                    items: { $ref: '#/components/schemas/ErrorItem' }
+        "409":
+          description: Insufficient stock for one or more items — entire transaction rolled back.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: false }
+                  message: { type: string, examples: ["Insufficient stock for one or more items"] }
+                  data: { type: "null" }
+                  errors:
+                    type: array
+                    items: { $ref: '#/components/schemas/ErrorItem' }
+
+  /transactions/{transactionId}:
+    get:
+      tags: [Transactions]
+      summary: Get a single transaction with its line items
+      description: Cashier may only view their own transactions (403 otherwise); Admin may view any transaction in the store.
+      parameters: [{ $ref: '#/components/parameters/TransactionIdPath' }]
+      responses:
+        "200":
+          description: Transaction found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/Transaction' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  /reports/sales:
+    get:
+      tags: [Reports]
+      summary: Generate a date-ranged sales report (Admin only)
+      x-required-role: admin
+      parameters:
+        - { $ref: '#/components/parameters/DateFromParam', required: true }
+        - { $ref: '#/components/parameters/DateToParam', required: true }
+        - name: group_by
+          in: query
+          schema: { type: string, enum: [day, week, month], default: day }
+      responses:
+        "200":
+          description: Sales report.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/SalesReport' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+
+  /ml/predict-stock/{productId}:
+    get:
+      tags: [ML]
+      summary: Get stock depletion forecast for a product (Admin only)
+      x-required-role: admin
+      description: >
+        Orchestrates Part 4 §4.3's sequence: Express checks data
+        sufficiency (BR-13) before deciding whether to call the internal
+        FastAPI ML service at all. See the separate Internal ML Service
+        specification for the underlying POST /predict-stock contract.
+      parameters: [{ $ref: '#/components/parameters/ProductIdPath' }]
+      responses:
+        "200":
+          description: Forecast (or naive-average fallback).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/StockForecast' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  /ml/predict-demand/{productId}:
+    get:
+      tags: [ML]
+      summary: Get demand prediction for a product (Admin only)
+      x-required-role: admin
+      parameters: [{ $ref: '#/components/parameters/ProductIdPath' }]
+      responses:
+        "200":
+          description: Demand prediction (or naive-average fallback).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/DemandPrediction' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  /ml/restock-recommendation/{productId}:
+    get:
+      tags: [ML]
+      summary: Get restock quantity recommendation for a product (Admin only)
+      x-required-role: admin
+      description: Derived from current_stock, estimated_daily_demand (from /ml/predict-demand), lead_time_days, and a safety-stock buffer (FR-13).
+      parameters: [{ $ref: '#/components/parameters/ProductIdPath' }]
+      responses:
+        "200":
+          description: Restock recommendation.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/RestockRecommendation' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+
+  /ml/insights:
+    get:
+      tags: [ML]
+      summary: Get aggregated sales insights for the store (Admin only)
+      x-required-role: admin
+      description: Implements FR-14 — weekly growth %, best-selling product, best category, fastest-growing product, top 5 products.
+      parameters:
+        - name: period
+          in: query
+          schema: { type: string, enum: [last_7_days, last_30_days], default: last_7_days }
+      responses:
+        "200":
+          description: Insights bundle.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/Insights' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
