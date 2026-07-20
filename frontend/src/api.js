@@ -1,6 +1,6 @@
 import { supabase } from './supabase';
 
-const API_URL = 'http://localhost:3000/api/v1';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000/api/v1';
 
 /**
  * Helper function to perform authenticated fetch requests to the Express backend
