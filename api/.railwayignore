@@ -1,0 +1,8 @@
+# Exclude test files from Railway deploy
+__tests__/
+*.test.js
+*.spec.js
+
+# Exclude local dev files
+.env
+nodemon.json

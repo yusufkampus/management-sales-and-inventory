@@ -13,6 +13,11 @@ app = FastAPI(title="Internal ML Service API")
 # Configuration
 INTERNAL_SERVICE_KEY = os.getenv("INTERNAL_ML_SECRET", "dev_secret_key")
 
+# Health check endpoint (no auth required — used by HF Spaces & monitoring)
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "service": "ml-service"}
+
 # Dependency for Internal Authentication
 def verify_internal_key(x_internal_service_key: str = Header(...)):
     if x_internal_service_key != INTERNAL_SERVICE_KEY:
