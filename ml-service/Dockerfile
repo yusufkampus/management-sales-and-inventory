@@ -14,5 +14,5 @@ COPY . .
 EXPOSE 7860
 
 # Start the FastAPI application with uvicorn
-# HF Spaces requires binding to 0.0.0.0 and port 7860
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
+# Support both HF Spaces (default 7860) and Railway (dynamic PORT)
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860}
